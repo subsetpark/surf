@@ -95,7 +95,7 @@ typedef struct {
 } Parameter;
 
 typedef struct Client {
-	GtkWidget *win;
+	GtkWidget *win, *box;
 	WebKitWebView *view;
 	WebKitWebInspector *inspector;
 	WebKitFindController *finder;
@@ -108,6 +108,16 @@ typedef struct Client {
 	const char *needle;
 	struct Client *next;
 } Client;
+
+typedef struct Download {
+	Client *c;
+	WebKitDownload *wd;
+	char *dest;
+	GtkWidget *progress, *btn1, *btn2;
+	guint64 l, s;
+	gdouble p, elapsed;
+	int hidden, failed, finished;
+} Download;
 
 typedef struct {
 	guint mod;
@@ -200,10 +210,14 @@ static void decidenewwindow(WebKitPolicyDecision *d, Client *c);
 static void decideresource(WebKitPolicyDecision *d, Client *c);
 static void insecurecontent(WebKitWebView *v, WebKitInsecureContentEvent e,
                             Client *c);
-static void downloadstarted(WebKitWebContext *wc, WebKitDownload *d,
+static void downloadstarted(WebKitWebContext *wc, WebKitDownload *wd,
                             Client *c);
-static void responsereceived(WebKitDownload *d, GParamSpec *ps, Client *c);
-static void download(Client *c, WebKitURIResponse *r);
+static gboolean decidedestination(WebKitDownload *wd, gchar *f, Download *d);
+static void createddestination(WebKitDownload *wd, gchar *dest, Download *d);
+static void downloadprogress(WebKitDownload *wd, guint64 s, Download *d);
+static void downloadaction(GtkButton *btn, Download *d);
+void downloadfailed(WebKitDownload *wd, GError *e, Download *d);
+void downloadfinished(WebKitDownload *wd, Download *d);
 static void closeview(WebKitWebView *v, Client *c);
 static void destroywin(GtkWidget* w, Client *c);
 
@@ -340,6 +354,7 @@ setup(void)
 	scriptfile = buildfile(scriptfile);
 	cachedir   = buildpath(cachedir);
 	certdir    = buildpath(certdir);
+	downloaddir = buildpath(downloaddir);
 
 	gdkkb = gdk_seat_get_keyboard(gdk_display_get_default_seat(gdpy));
 
@@ -1116,7 +1131,7 @@ newview(Client *c, WebKitWebView *rv)
 		/* Currently only works with text file to be compatible with curl */
 		webkit_cookie_manager_set_persistent_storage(
 		    webkit_web_context_get_cookie_manager(context), cookiefile,
-		    WEBKIT_COOKIE_PERSISTENT_STORAGE_TEXT);
+		    WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
 		/* cookie policy */
 		webkit_cookie_manager_set_accept_policy(
 		    webkit_web_context_get_cookie_manager(context),
@@ -1300,7 +1315,9 @@ showview(WebKitWebView *v, Client *c)
 
 	c->win = createwindow(c);
 
-	gtk_container_add(GTK_CONTAINER(c->win), GTK_WIDGET(c->view));
+	c->box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	gtk_box_pack_start(GTK_BOX(c->box), GTK_WIDGET(c->view), TRUE, TRUE, 0);
+	gtk_container_add(GTK_CONTAINER(c->win), GTK_WIDGET(c->box));
 	gtk_widget_show_all(c->win);
 	gtk_widget_grab_focus(GTK_WIDGET(c->view));
 
@@ -1636,8 +1653,7 @@ decideresource(WebKitPolicyDecision *d, Client *c)
 	if (webkit_response_policy_decision_is_mime_type_supported(r)) {
 		webkit_policy_decision_use(d);
 	} else {
-		webkit_policy_decision_ignore(d);
-		download(c, res);
+		webkit_policy_decision_download(d);
 	}
 }
 
@@ -1648,24 +1664,189 @@ insecurecontent(WebKitWebView *v, WebKitInsecureContentEvent e, Client *c)
 }
 
 void
-downloadstarted(WebKitWebContext *wc, WebKitDownload *d, Client *c)
+downloadresponse(WebKitDownload *wd, GParamSpec *ps, Download *d)
 {
-	g_signal_connect(G_OBJECT(d), "notify::response",
-	                 G_CALLBACK(responsereceived), c);
+	d->l = webkit_uri_response_get_content_length(
+	       webkit_download_get_response(wd));
 }
 
 void
-responsereceived(WebKitDownload *d, GParamSpec *ps, Client *c)
+downloadstarted(WebKitWebContext *wc, WebKitDownload *wd, Client *c)
 {
-	download(c, webkit_download_get_response(d));
-	webkit_download_cancel(d);
+	Download *d;
+
+	if (!(d = calloc(1, sizeof(Download))))
+		die("Cannot malloc!\n");
+	d->c = c;
+	d->wd = wd;
+
+	g_signal_connect(G_OBJECT(wd), "decide-destination",
+	                 G_CALLBACK(decidedestination), d);
+	g_signal_connect(G_OBJECT(wd), "created-destination",
+	                 G_CALLBACK(createddestination), d);
+	g_signal_connect(G_OBJECT(wd), "notify::response",
+	                 G_CALLBACK(downloadresponse), d);
+	g_signal_connect(G_OBJECT(wd), "received-data",
+	                 G_CALLBACK(downloadprogress), d);
+	g_signal_connect(G_OBJECT(wd), "failed",
+	                 G_CALLBACK(downloadfailed), d);
+	g_signal_connect(G_OBJECT(wd), "finished",
+	                 G_CALLBACK(downloadfinished), d);
+}
+
+gboolean
+decidedestination(WebKitDownload *wd, gchar *f, Download *d)
+{
+	int i = 0;
+	gchar *path, *newf, *uri;
+
+	path = g_build_filename(downloaddir, f, NULL);
+	while (g_file_test(path, G_FILE_TEST_EXISTS)) {
+		g_free(path);
+		newf = g_strdup_printf("%s-%i", f, ++i);
+		path = g_build_filename(downloaddir, newf, NULL);
+		g_free(newf);
+	}
+	uri = g_filename_to_uri(path, NULL, NULL);
+	g_free(path);
+	webkit_download_set_destination(wd, uri);
+	g_free(uri);
+
+	return TRUE;
 }
 
 void
-download(Client *c, WebKitURIResponse *r)
+createddestination(WebKitDownload *wd, gchar *dest, Download *d)
 {
-	Arg a = (Arg)DOWNLOAD(webkit_uri_response_get_uri(r), geturi(c));
-	spawn(c, &a);
+	GtkWidget *box, *btnbox;
+
+	d->dest = g_filename_from_uri(dest, NULL, NULL);
+	d->progress = gtk_progress_bar_new();
+	d->btn1 = gtk_button_new_with_label("Cancel");
+	d->btn2 = gtk_button_new_with_label("Hide");
+
+	box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+	btnbox = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+
+	gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(d->progress), TRUE);
+	gtk_progress_bar_set_text(GTK_PROGRESS_BAR(d->progress), dest);
+	gtk_container_set_border_width(GTK_CONTAINER(box), 5);
+
+	gtk_box_pack_start(GTK_BOX(btnbox), d->btn1, FALSE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(btnbox), d->btn2, FALSE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(box), d->progress, TRUE, TRUE, 0);
+	gtk_box_pack_start(GTK_BOX(box), btnbox, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(d->c->box), box, FALSE, FALSE, 0);
+
+	g_signal_connect(G_OBJECT(d->btn1), "clicked",
+	                 G_CALLBACK(downloadaction), d);
+	g_signal_connect(G_OBJECT(d->btn2), "clicked",
+	                 G_CALLBACK(downloadaction), d);
+
+	gtk_widget_show_all(box);
+}
+
+void
+downloadprogress(WebKitDownload *wd, guint64 sz, Download *d)
+{
+	gchar *s;
+	const double smooth = 0.9, interval = 0.5;
+	static gdouble t = 0;
+	gdouble speedavg, speednow, etr,
+	        elapsed = webkit_download_get_elapsed_time(wd),
+	        dt = elapsed - t;
+
+	d->s += sz;
+	d->p = d->l ? (float)d->s / d->l : 0.5;
+	d->elapsed = elapsed;
+
+	if (d->hidden || d->p != 1.0 && dt < interval && dt > 0)
+		return;
+
+	t = elapsed;
+	if (d->l) {
+		speedavg = d->s / elapsed;
+		speednow = sz / dt;
+		etr = (d->l - d->s) /
+		    (smooth * speedavg + (1.0 - smooth) * speednow);
+		s = g_strdup_printf("%s, %lu/%lu (%d%%), etr: %dm%02ds",
+		                    d->dest, d->s, d->l, (int)(d->p * 100),
+		                    (int)etr / 60, (int)etr % 60);
+	} else {
+		s = g_strdup_printf("%s, %lu", d->dest, d->s);
+	}
+	gtk_progress_bar_set_text(GTK_PROGRESS_BAR(d->progress), s);
+	g_free(s);
+	gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(d->progress), d->p);
+}
+
+void
+downloadaction(GtkButton *btn, Download *d)
+{
+	Arg arg;
+
+	if (btn != GTK_BUTTON(d->btn2)) {
+		if (!d->finished) {
+			webkit_download_cancel(d->wd);
+		} else {
+			if (d->failed)
+				unlink(d->dest);
+			else {
+				arg = (Arg)PLUMB(d->dest);
+				spawn(d->c, &arg);
+			}
+		}
+	} else if (!d->finished) {
+		d->hidden = 1;
+		gtk_widget_hide(gtk_widget_get_parent(d->progress));
+	}
+
+	if (d->wd)
+		return;
+
+	gtk_widget_destroy(gtk_widget_get_parent(d->progress));
+	g_free(d->dest);
+	free(d);
+}
+
+void
+downloadfinished(WebKitDownload *wd, Download *d)
+{
+	char *s;
+
+	d->finished = 1;
+	d->wd = NULL;
+	gtk_button_set_label(GTK_BUTTON(d->btn2), "Close");
+	if (d->failed) {
+		if (g_file_test(d->dest, G_FILE_TEST_EXISTS))
+			gtk_button_set_label(GTK_BUTTON(d->btn1), "Remove");
+		else
+			gtk_widget_destroy(d->btn1);
+	} else {
+		d->p = 1.0;
+		gtk_button_set_label(GTK_BUTTON(d->btn1), "Open");
+		gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(d->progress), d->p);
+	}
+	if (d->failed && d->l) {
+		s = g_strdup_printf("%s: %s, %lu/%lu (%d%%) in %dm%02ds",
+		                    "Error", d->dest,
+		                    d->s, d->l, (int)(d->p * 100),
+		                    (int)d->elapsed / 60, (int)d->elapsed % 60);
+	} else {
+		s = g_strdup_printf("%s: %s, %lu in %dm%02ds", d->failed ?
+		                    "Error" : "Finished", d->dest, d->s,
+		                    (int)d->elapsed / 60, (int)d->elapsed % 60);
+	}
+	gtk_progress_bar_set_text(GTK_PROGRESS_BAR(d->progress), s);
+	g_free(s);
+	gtk_widget_show_all(gtk_widget_get_parent(d->progress));
+	d->hidden = 0;
+}
+
+void
+downloadfailed(WebKitDownload *wd, GError *e, Download *d)
+{
+	d->failed = 1;
 }
 
 void
